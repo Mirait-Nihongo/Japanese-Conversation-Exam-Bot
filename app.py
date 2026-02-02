@@ -7,7 +7,7 @@ import google.generativeai as genai
 from google.cloud import speech
 from google.oauth2 import service_account
 import gspread
-import importlib.metadata # バージョン確認用
+import importlib.metadata
 
 # --- ページ設定 ---
 st.set_page_config(page_title="日本語会話試験システム", page_icon="🏫", layout="wide")
@@ -32,6 +32,7 @@ def get_gcp_credentials():
     return None
 
 def configure_gemini():
+    # 念のため毎回設定を読み込む
     if "GEMINI_API_KEY" in st.secrets:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
         return True
@@ -40,32 +41,49 @@ def configure_gemini():
 # --- 教科書読み込み ---
 @st.cache_resource
 def upload_textbook_to_gemini():
+    if not configure_gemini(): return [] # アップロード前にも認証
+    
     if not os.path.exists(MATERIALS_DIR): os.makedirs(MATERIALS_DIR)
     uploaded_files = []
     for file in os.listdir(MATERIALS_DIR):
         if file.lower().endswith(".pdf"):
             try:
                 g_file = genai.upload_file(os.path.join(MATERIALS_DIR, file))
-                while g_file.state.name == "PROCESSING": time.sleep(1); g_file = genai.get_file(g_file.name)
-                if g_file.state.name == "ACTIVE": uploaded_files.append(g_file)
+                # 処理完了まで待機
+                while g_file.state.name == "PROCESSING": 
+                    time.sleep(1)
+                    g_file = genai.get_file(g_file.name)
+                if g_file.state.name == "ACTIVE": 
+                    uploaded_files.append(g_file)
             except: pass
     return uploaded_files
 
-# --- 安全な生成関数 (診断済みモデルを使用) ---
-def safe_generate_content(prompt_content):
-    # 診断画面で存在が確認された最も標準的なモデル名を使用
-    target_model = "gemini-1.5-flash" 
+# --- 強力な生成関数 (自動リトライ・モデル切り替え) ---
+def safe_generate_content(content_data):
+    # 生成の直前にも必ず認証を通す（これが重要）
+    configure_gemini()
     
-    try:
-        model = genai.GenerativeModel(target_model)
-        return model.generate_content(prompt_content).text
-    except Exception as e:
-        # 万が一のエラー時はProモデルにフォールバック
+    # 試行するモデルのリスト（診断で見つかった名前を優先）
+    candidate_models = [
+        "models/gemini-1.5-flash",       # 最優先：完全修飾名
+        "gemini-1.5-flash",              # エイリアス
+        "models/gemini-1.5-flash-001",   # バージョン固定
+        "models/gemini-1.5-pro",         # フォールバック
+        "gemini-pro"                     # 最終手段
+    ]
+    
+    last_error = ""
+    
+    for model_name in candidate_models:
         try:
-            model = genai.GenerativeModel("gemini-1.5-pro")
-            return model.generate_content(prompt_content).text
-        except:
-            return f"生成エラー: {e}"
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(content_data)
+            return response.text # 成功したら即リターン
+        except Exception as e:
+            last_error = str(e)
+            continue # 次のモデルを試す
+            
+    return f"生成エラー: すべてのモデルで接続に失敗しました。\n詳細: {last_error}"
 
 # --- Gemini 質問生成 ---
 def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
@@ -111,12 +129,13 @@ def evaluate_response(question, answer, cefr, phase):
     回答: {answer}
     出力: Markdown箇条書きで 1.レベル判定(達成/未達) 2.文法・語彙の正確さ 3.アドバイス
     """
-    return safe_generate_content(prompt)
+    return safe_generate_content([prompt])
 
 # --- 音声認識 ---
 def speech_to_text(audio_bytes):
     creds = get_gcp_credentials()
-    if not creds: return None, "認証エラー"
+    if not creds: return None, "認証エラー: GCPキー設定を確認してください"
+    
     client = speech.SpeechClient(credentials=creds)
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED,
@@ -131,14 +150,14 @@ def speech_to_text(audio_bytes):
         return res.results[0].alternatives[0].transcript, None
     except Exception as e: return None, str(e)
 
-# --- 保存処理 (URL対応版) ---
+# --- 保存処理 ---
 def save_result(student_info, level, exam_context, history):
     creds = get_gcp_credentials()
     if not creds: return False, "認証エラー"
     
     sheet_url = exam_context.get("sheet_url")
     if not sheet_url:
-        return False, "スプレッドシートのURLが設定されていません。管理者に連絡してください。"
+        return False, "スプレッドシートのURLが設定されていません。"
 
     try:
         scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
@@ -148,7 +167,8 @@ def save_result(student_info, level, exam_context, history):
         
         exam_name = f"{exam_context['year']} {exam_context['type']}" if exam_context['is_exam'] else "練習モード"
         
-        summary = safe_generate_content(f"以下の会話ログから総評を100文字で:\n{str(history)}")
+        # 総評の生成
+        summary = safe_generate_content([f"以下の会話ログから総評を100文字で:\n{str(history)}"])
         
         row = [
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), 
@@ -177,10 +197,9 @@ if "exam_config" not in st.session_state: st.session_state.exam_config = {"is_ex
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ システム設定")
-    # バージョン表示（念のため残しておきます）
     try:
         ver = importlib.metadata.version("google-generativeai")
-        st.caption(f"Ver: {ver}")
+        st.caption(f"System Ver: {ver}")
     except: pass
 
     mode = st.radio("モード選択", ["🐣 練習モード", "📝 試験モード"], index=0 if not st.session_state.exam_config["is_exam"] else 1)
@@ -234,6 +253,7 @@ with st.sidebar:
                 st.warning("設定にはパスワードが必要です")
 
     st.divider()
+    # 初期化時に一度実行
     if configure_gemini():
         with st.spinner("資料読込中..."):
             textbooks = upload_textbook_to_gemini()
@@ -323,7 +343,6 @@ elif st.session_state.exam_state == "interview":
                 mp3_path = webm_path + ".mp3"
                 
                 # FFmpegで変換
-                # -y: 上書き許可, -loglevel error: エラーのみ表示
                 cmd_res = os.system(f'ffmpeg -y -i "{webm_path}" -ac 1 -ar 16000 -ab 32k "{mp3_path}" -loglevel error')
                 
                 if cmd_res != 0 or not os.path.exists(mp3_path):
@@ -338,8 +357,7 @@ elif st.session_state.exam_state == "interview":
                     try:
                         os.remove(webm_path)
                         os.remove(mp3_path)
-                    except:
-                        pass
+                    except: pass
 
                     if text:
                         st.session_state.history.append({"role": "student", "text": text})
