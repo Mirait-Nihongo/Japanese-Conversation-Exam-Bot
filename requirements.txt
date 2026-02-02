@@ -4,3 +4,4 @@ google-cloud-speech
 google-auth
 gspread
 oauth2client
+google-cloud-texttospeech
