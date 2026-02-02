@@ -50,6 +50,20 @@ def upload_textbook_to_gemini():
             except: pass
     return uploaded_files
 
+# --- 安全な生成関数 (モデル自動切り替え) ---
+def safe_generate_content(model_name, prompt_content):
+    # メイン: Flash 001 (確実なバージョン指定)
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash-001")
+        return model.generate_content(prompt_content).text
+    except Exception as e_flash:
+        # サブ: Pro (どうしてもダメな場合の予備)
+        try:
+            model = genai.GenerativeModel("gemini-pro")
+            return model.generate_content(prompt_content).text
+        except Exception as e_pro:
+            return f"システムエラー: モデルに接続できませんでした。\nFlash: {e_flash}\nPro: {e_pro}"
+
 # --- Gemini 質問生成 ---
 def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
     history_text = "\n".join([f"{h['role']}: {h['text']}" for h in history if h['role'] in ['examiner', 'student']])
@@ -80,19 +94,14 @@ def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
     3. 質問文のみを出力してください。
     """
     
-    # ★修正箇所：モデル名を変更
-    model = genai.GenerativeModel("gemini-1.5-flash-latest")
     content = [prompt]
     if textbook_files: content.extend(textbook_files)
     
-    try:
-        return model.generate_content(content).text
-    except Exception as e: return f"エラー: {e}"
+    # ★修正: 安全な生成関数を使用
+    return safe_generate_content("gemini-1.5-flash-001", content)
 
 # --- 評価生成 ---
 def evaluate_response(question, answer, cefr, phase):
-    # ★修正箇所：モデル名を変更
-    model = genai.GenerativeModel("gemini-1.5-flash-latest")
     prompt = f"""
     評価者として分析してください。
     目標: {cefr}, フェーズ: {phase}
@@ -100,9 +109,8 @@ def evaluate_response(question, answer, cefr, phase):
     回答: {answer}
     出力: Markdown箇条書きで 1.レベル判定(達成/未達) 2.文法・語彙の正確さ 3.アドバイス
     """
-    try:
-        return model.generate_content(prompt).text
-    except: return "評価エラー"
+    # ★修正: 安全な生成関数を使用
+    return safe_generate_content("gemini-1.5-flash-001", prompt)
 
 # --- 音声認識 ---
 def speech_to_text(audio_bytes):
@@ -139,9 +147,8 @@ def save_result(student_info, level, exam_context, history):
         
         exam_name = f"{exam_context['year']} {exam_context['type']}" if exam_context['is_exam'] else "練習モード"
         
-        # ★修正箇所：モデル名を変更
-        model = genai.GenerativeModel("gemini-1.5-flash-latest")
-        summary = model.generate_content(f"以下の会話ログから総評を100文字で:\n{str(history)}").text
+        # ★修正: 安全な生成関数を使用
+        summary = safe_generate_content("gemini-1.5-flash-001", f"以下の会話ログから総評を100文字で:\n{str(history)}")
         
         row = [
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), 
@@ -170,6 +177,14 @@ if "exam_config" not in st.session_state: st.session_state.exam_config = {"is_ex
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ システム設定")
+    
+    # バージョン確認用デバッグ表示
+    import importlib.metadata
+    try:
+        ver = importlib.metadata.version("google-generativeai")
+        st.caption(f"System Ver: {ver}")
+    except: pass
+    
     mode = st.radio("モード選択", ["🐣 練習モード", "📝 試験モード"], index=0 if not st.session_state.exam_config["is_exam"] else 1)
     
     if mode == "🐣 練習モード":
