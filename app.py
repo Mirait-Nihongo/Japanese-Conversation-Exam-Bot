@@ -7,43 +7,11 @@ import google.generativeai as genai
 from google.cloud import speech
 from google.oauth2 import service_account
 import gspread
+import importlib.metadata # バージョン確認用
 
 # --- ページ設定 ---
 st.set_page_config(page_title="日本語会話試験システム", page_icon="🏫", layout="wide")
-# --- ⬇️ ここから診断コード ---
-st.divider()
-st.subheader("🔍 システム診断モード")
 
-# 1. APIキーが読み込めているか確認
-if "GEMINI_API_KEY" in st.secrets:
-    raw_key = st.secrets["GEMINI_API_KEY"]
-    # キーの最初と最後だけ表示（セキュリティのため）
-    safe_key = f"{raw_key[:5]}...{raw_key[-5:]}" if len(raw_key) > 10 else "短い/不正"
-    st.write(f"✅ APIキー認識: {safe_key} (文字数: {len(raw_key)})")
-    
-    # 2. 実際にGoogleに接続テスト
-    try:
-        genai.configure(api_key=raw_key)
-        models = list(genai.list_models())
-        st.write("✅ Google接続成功！利用可能なモデル一覧:")
-        found_flash = False
-        for m in models:
-            if "gemini" in m.name:
-                st.code(m.name) # ここに gemini-1.5-flash があるか確認
-                if "flash" in m.name: found_flash = True
-        
-        if found_flash:
-            st.success("🎉 Gemini Flash が見つかりました！システムは正常です。")
-        else:
-            st.error("⚠️ 接続はできましたが、Flashモデルの権限がありません。")
-            
-    except Exception as e:
-        st.error(f"❌ API接続エラー: {e}")
-        st.info("ヒント: キーが無効か、Google AI Studioで作成されていません。")
-else:
-    st.error("❌ APIキーが Secrets に設定されていません！")
-st.divider()
-# --- ⬆️ ここまで診断コード ---
 # --- 定数・初期設定 ---
 MATERIALS_DIR = "materials"
 OPI_PHASES = {
@@ -83,19 +51,21 @@ def upload_textbook_to_gemini():
             except: pass
     return uploaded_files
 
-# --- 安全な生成関数 (モデル自動切り替え) ---
-def safe_generate_content(model_name, prompt_content):
-    # メイン: Flash 001 (確実なバージョン指定)
+# --- 安全な生成関数 (診断済みモデルを使用) ---
+def safe_generate_content(prompt_content):
+    # 診断画面で存在が確認された最も標準的なモデル名を使用
+    target_model = "gemini-1.5-flash" 
+    
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash-001")
+        model = genai.GenerativeModel(target_model)
         return model.generate_content(prompt_content).text
-    except Exception as e_flash:
-        # サブ: Pro (どうしてもダメな場合の予備)
+    except Exception as e:
+        # 万が一のエラー時はProモデルにフォールバック
         try:
-            model = genai.GenerativeModel("gemini-pro")
+            model = genai.GenerativeModel("gemini-1.5-pro")
             return model.generate_content(prompt_content).text
-        except Exception as e_pro:
-            return f"システムエラー: モデルに接続できませんでした。\nFlash: {e_flash}\nPro: {e_pro}"
+        except:
+            return f"生成エラー: {e}"
 
 # --- Gemini 質問生成 ---
 def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
@@ -130,8 +100,7 @@ def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
     content = [prompt]
     if textbook_files: content.extend(textbook_files)
     
-    # ★修正: 安全な生成関数を使用
-    return safe_generate_content("gemini-1.5-flash-001", content)
+    return safe_generate_content(content)
 
 # --- 評価生成 ---
 def evaluate_response(question, answer, cefr, phase):
@@ -142,8 +111,7 @@ def evaluate_response(question, answer, cefr, phase):
     回答: {answer}
     出力: Markdown箇条書きで 1.レベル判定(達成/未達) 2.文法・語彙の正確さ 3.アドバイス
     """
-    # ★修正: 安全な生成関数を使用
-    return safe_generate_content("gemini-1.5-flash-001", prompt)
+    return safe_generate_content(prompt)
 
 # --- 音声認識 ---
 def speech_to_text(audio_bytes):
@@ -180,8 +148,7 @@ def save_result(student_info, level, exam_context, history):
         
         exam_name = f"{exam_context['year']} {exam_context['type']}" if exam_context['is_exam'] else "練習モード"
         
-        # ★修正: 安全な生成関数を使用
-        summary = safe_generate_content("gemini-1.5-flash-001", f"以下の会話ログから総評を100文字で:\n{str(history)}")
+        summary = safe_generate_content(f"以下の会話ログから総評を100文字で:\n{str(history)}")
         
         row = [
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), 
@@ -210,14 +177,12 @@ if "exam_config" not in st.session_state: st.session_state.exam_config = {"is_ex
 # --- サイドバー ---
 with st.sidebar:
     st.header("⚙️ システム設定")
-    
-    # バージョン確認用デバッグ表示
-    import importlib.metadata
+    # バージョン表示（念のため残しておきます）
     try:
         ver = importlib.metadata.version("google-generativeai")
-        st.caption(f"System Ver: {ver}")
+        st.caption(f"Ver: {ver}")
     except: pass
-    
+
     mode = st.radio("モード選択", ["🐣 練習モード", "📝 試験モード"], index=0 if not st.session_state.exam_config["is_exam"] else 1)
     
     if mode == "🐣 練習モード":
