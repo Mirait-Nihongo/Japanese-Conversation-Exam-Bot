@@ -1,6 +1,6 @@
-streamlit
+streamlit>=1.39.0
 google-cloud-speech
-google-generativeai
+google-generativeai>=0.8.0
 gspread
 oauth2client
 requests
