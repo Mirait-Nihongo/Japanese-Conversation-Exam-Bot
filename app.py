@@ -163,4 +163,199 @@ def save_result(student_info, level, exam_context, history):
     creds = get_gcp_credentials()
     if not creds: return False, "認証エラー"
     sheet_url = exam_context.get("sheet_url")
-    if not sheet_url: return False, "URL未設定
+    if not sheet_url: return False, "URL未設定" # ★ここの引用符を修正しました
+
+    try:
+        scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+        client = gspread.authorize(creds.with_scopes(scope))
+        sheet = client.open_by_url(sheet_url).sheet1
+        
+        exam_name = f"{exam_context['year']} {exam_context['type']}" if exam_context['is_exam'] else "練習"
+        summary = safe_generate_content([f"会話ログから総評を100文字で:\n{str(history)}"])
+        
+        row = [
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), 
+            exam_name, exam_context.get('class', '-'), student_info['class'],
+            student_info['id'], student_info['name'], level, summary
+        ]
+        sheet.append_row(row)
+        return True, summary
+    except Exception as e: return False, str(e)
+
+
+# ==========================================
+# UI & ロジック
+# ==========================================
+
+if "history" not in st.session_state: st.session_state.history = []
+if "exam_state" not in st.session_state: st.session_state.exam_state = "setting"
+if "phase_index" not in st.session_state: st.session_state.phase_index = 0
+if "exam_config" not in st.session_state: st.session_state.exam_config = {"is_exam": False}
+if "latest_audio" not in st.session_state: st.session_state.latest_audio = None
+
+# --- サイドバー ---
+with st.sidebar:
+    st.header("⚙️ システム設定")
+    mode = st.radio("モード", ["🐣 練習モード", "📝 試験モード"], index=0 if not st.session_state.exam_config["is_exam"] else 1)
+    
+    if mode == "🐣 練習モード":
+        st.session_state.exam_config = {"is_exam": False}
+        st.info("AIが声で話しかけます。")
+        
+    elif mode == "📝 試験モード":
+        st.divider()
+        pwd = st.text_input("管理者パスワード", type="password")
+        if pwd == ADMIN_PASSWORD:
+            with st.form("exam_settings"):
+                ex_year = st.number_input("年度", value=2025)
+                ex_type = st.selectbox("種別", ["中間", "期末"])
+                ex_class = st.text_input("クラス")
+                ex_cefr = st.selectbox("レベル", ["A1", "A2", "B1", "B2"])
+                ex_url = st.text_input("シートURL")
+                
+                if st.form_submit_button("設定"):
+                    st.session_state.exam_config = {
+                        "is_exam": True, "year": ex_year, "type": ex_type,
+                        "class": ex_class, "level": ex_cefr, "sheet_url": ex_url
+                    }
+                    st.session_state.exam_state = "setting"
+                    st.session_state.history = []
+                    st.rerun()
+
+    st.divider()
+    if configure_gemini():
+        upload_textbook_to_gemini()
+    if st.button("リセット"):
+        st.session_state.clear()
+        st.rerun()
+
+# --- メインエリア ---
+if st.session_state.exam_config["is_exam"]:
+    conf = st.session_state.exam_config
+    st.title(f"📝 {conf['year']} {conf['type']}")
+else:
+    st.title("🗣️ 日本語会話 (Gemini Live Mode)")
+
+# 1. 設定画面
+if st.session_state.exam_state == "setting":
+    st.markdown("### 受験者情報を入力してください")
+    c1, c2, c3 = st.columns(3)
+    with c1: s_class = st.text_input("クラス")
+    with c2: s_id = st.text_input("番号")
+    with c3: s_name = st.text_input("氏名")
+    
+    if s_name:
+        if st.button("確認して次へ", type="primary"):
+            st.session_state.student_info = {"name": s_name, "class": s_class, "id": s_id}
+            st.session_state.cefr_level = st.session_state.exam_config.get("level", "A2")
+            st.session_state.phase_index = 0
+            st.session_state.exam_state = "ready"
+            st.rerun()
+
+# 2. 開始待機画面
+elif st.session_state.exam_state == "ready":
+    st.markdown(f"## こんにちは、{st.session_state.student_info['name']} さん。")
+    st.divider()
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if st.button("🔴 試験を開始する", type="primary", use_container_width=True):
+            st.session_state.exam_state = "interview"
+            current = PHASE_ORDER[0]
+            with st.spinner("AIが質問を生成しています..."):
+                q = get_opi_question(st.session_state.cefr_level, current, [], st.session_state.student_info, [], st.session_state.exam_config)
+                st.session_state.history.append({"role": "examiner", "text": q, "phase": current})
+                audio_data = text_to_speech(q)
+                st.session_state.latest_audio = audio_data
+                st.rerun()
+
+# 3. 会話画面
+elif st.session_state.exam_state == "interview":
+    # 進捗バー
+    prog = (st.session_state.phase_index + 1) / len(PHASE_ORDER)
+    st.progress(prog)
+    
+    last_q = st.session_state.history[-1]["text"]
+    
+    st.markdown(f"""
+    <div style="background-color:#e8f0fe;padding:20px;border-radius:10px;margin-bottom:20px;">
+        <h3 style="margin:0;">👮 先生: {last_q}</h3>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if st.session_state.latest_audio:
+        st.audio(st.session_state.latest_audio, format="audio/mp3", autoplay=True)
+    
+    with st.expander("これまでの会話履歴"):
+        for chat in st.session_state.history[:-1]:
+            role = "👮" if chat["role"]=="examiner" else "🧑‍🎓"
+            st.write(f"{role}: {chat['text']}")
+
+    st.markdown("---")
+    st.write("👇 **マイクボタンを押して録音を開始し、終わったら停止ボタンを押してください**")
+    
+    # マイク入力
+    audio_val = st.audio_input("回答を録音")
+    
+    if audio_val:
+        # すでにテキスト変換済みかチェック
+        if "temp_text" not in st.session_state:
+            with st.spinner("音声を文字に変換中..."):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+                    tmp.write(audio_val.getvalue())
+                    webm_path = tmp.name
+                mp3_path = webm_path + ".mp3"
+                os.system(f'ffmpeg -y -i "{webm_path}" -ac 1 -ar 16000 -ab 32k "{mp3_path}" -loglevel quiet')
+                
+                with open(mp3_path, "rb") as f: content = f.read()
+                text, err = speech_to_text(content)
+                try: os.remove(webm_path); os.remove(mp3_path)
+                except: pass
+                
+                if text:
+                    st.session_state.temp_text = text
+                else:
+                    st.error("うまく聞き取れませんでした。もう一度録音してください。")
+        
+        # 変換されたテキストがあれば、確認ボタンを表示
+        if "temp_text" in st.session_state:
+            st.success(f"🗣️ **あなたの回答:** {st.session_state.temp_text}")
+            
+            col_a, col_b = st.columns([1,1])
+            with col_a:
+                if st.button("✅ この内容で回答する", type="primary", use_container_width=True):
+                    text = st.session_state.temp_text
+                    del st.session_state.temp_text 
+                    
+                    st.session_state.history.append({"role": "student", "text": text})
+                    
+                    # 履歴依存ではなく、現在のフェーズ順序から取得 (KeyError対策済み)
+                    current_phase_key = PHASE_ORDER[st.session_state.phase_index]
+                    
+                    eval_text = evaluate_response(last_q, text, st.session_state.cefr_level, current_phase_key)
+                    st.session_state.history.append({"role": "grade", "text": eval_text})
+                    
+                    st.session_state.phase_index += 1
+                    if st.session_state.phase_index < len(PHASE_ORDER):
+                        next_p = PHASE_ORDER[st.session_state.phase_index]
+                        next_q = get_opi_question(st.session_state.cefr_level, next_p, st.session_state.history, st.session_state.student_info, [], st.session_state.exam_config)
+                        st.session_state.history.append({"role": "examiner", "text": next_q, "phase": next_p})
+                        
+                        next_audio = text_to_speech(next_q)
+                        st.session_state.latest_audio = next_audio
+                        st.rerun()
+                    else:
+                        st.session_state.exam_state = "finished"
+                        st.rerun()
+
+# 4. 終了
+elif st.session_state.exam_state == "finished":
+    st.balloons()
+    st.success("試験終了！")
+    if "saved" not in st.session_state:
+        ok, msg = save_result(st.session_state.student_info, st.session_state.cefr_level, st.session_state.exam_config, st.session_state.history)
+        st.session_state.saved = True
+        if ok: st.info(f"保存完了: {msg}")
+    
+    if st.button("トップへ戻る"):
+        st.session_state.clear()
+        st.rerun()
