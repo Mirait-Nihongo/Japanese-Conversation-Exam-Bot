@@ -59,7 +59,6 @@ def upload_textbook_to_gemini():
 # --- AI生成関数 (Gemini 2.0 Flash優先) ---
 def safe_generate_content(content_data):
     configure_gemini()
-    # あなたの環境で成功したモデル順
     candidate_models = [
         "models/gemini-2.0-flash",       
         "gemini-2.0-flash",              
@@ -88,7 +87,7 @@ def text_to_speech(text):
     # Gemini Live風の高品質な声 (Neural2)
     voice = texttospeech.VoiceSelectionParams(
         language_code="ja-JP",
-        name="ja-JP-Neural2-B" # B:女性, C:男性, D:男性(低音)
+        name="ja-JP-Neural2-B" 
     )
     
     audio_config = texttospeech.AudioConfig(
@@ -240,21 +239,41 @@ else:
 
 # 1. 設定画面
 if st.session_state.exam_state == "setting":
+    st.markdown("### 受験者情報を入力してください")
     c1, c2, c3 = st.columns(3)
     with c1: s_class = st.text_input("クラス")
     with c2: s_id = st.text_input("番号")
     with c3: s_name = st.text_input("氏名")
     
     if s_name:
-        if st.button("会話スタート", type="primary"):
+        # ここではまだ開始せず、情報を保存して「待機画面」へ送る
+        if st.button("確認して次へ", type="primary"):
             st.session_state.student_info = {"name": s_name, "class": s_class, "id": s_id}
             st.session_state.cefr_level = st.session_state.exam_config.get("level", "A2")
             st.session_state.phase_index = 0
+            st.session_state.exam_state = "ready" # 新しいステータス
+            st.rerun()
+
+# 2. 開始待機画面 (新設)
+elif st.session_state.exam_state == "ready":
+    st.markdown(f"""
+    ## こんにちは、{st.session_state.student_info['name']} さん。
+    
+    準備ができたら、下のボタンを押してください。
+    ボタンを押すと、AIが話し始めます。
+    """)
+    
+    st.divider()
+    
+    # ど真ん中に大きなボタンを置く
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        if st.button("🔴 試験を開始する (Start)", type="primary", use_container_width=True):
             st.session_state.exam_state = "interview"
             
             # 最初の質問生成
             current = PHASE_ORDER[0]
-            with st.spinner("AIが準備中..."):
+            with st.spinner("AIが質問を生成しています..."):
                 q = get_opi_question(st.session_state.cefr_level, current, [], st.session_state.student_info, [], st.session_state.exam_config)
                 st.session_state.history.append({"role": "examiner", "text": q, "phase": current})
                 # 音声生成
@@ -262,7 +281,7 @@ if st.session_state.exam_state == "setting":
                 st.session_state.latest_audio = audio_data
                 st.rerun()
 
-# 2. 会話画面 (Gemini Live風)
+# 3. 会話画面 (Gemini Live風)
 elif st.session_state.exam_state == "interview":
     # 進捗バー
     prog = (st.session_state.phase_index + 1) / len(PHASE_ORDER)
@@ -271,33 +290,27 @@ elif st.session_state.exam_state == "interview":
     # 最新の質問を表示
     last_q = st.session_state.history[-1]["text"]
     
-    # --- ここがGemini Live風のポイント ---
-    # 先生の顔アイコンと質問
     st.markdown(f"""
     <div style="background-color:#e8f0fe;padding:20px;border-radius:10px;margin-bottom:20px;">
         <h3 style="margin:0;">👮 先生: {last_q}</h3>
     </div>
     """, unsafe_allow_html=True)
 
-    # ★自動再生 (Autoplay)
+    # ★自動再生
     if st.session_state.latest_audio:
         st.audio(st.session_state.latest_audio, format="audio/mp3", autoplay=True)
-        # 一度再生したらクリアしないとリロードで何度も喋ってしまうので注意が必要だが、
-        # Streamlitの仕組み上、次の入力まで保持させる
     
-    # 履歴表示（折りたたみ）
-    with st.expander("これまでの会話履歴を見る"):
+    # 履歴
+    with st.expander("これまでの会話履歴"):
         for chat in st.session_state.history[:-1]:
             role = "👮" if chat["role"]=="examiner" else "🧑‍🎓"
             st.write(f"{role}: {chat['text']}")
-            if chat["role"]=="grade": st.caption(f"📝 {chat['text']}")
 
-    # 音声入力エリア
+    # 音声入力
     audio_val = st.audio_input("マイクボタンを押して返事してください")
     
     if audio_val:
         with st.spinner("聞いています..."):
-            # WebM -> MP3変換
             with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
                 tmp.write(audio_val.getvalue())
                 webm_path = tmp.name
@@ -310,10 +323,8 @@ elif st.session_state.exam_state == "interview":
             except: pass
 
             if text:
-                # 生徒の回答を保存
                 st.session_state.history.append({"role": "student", "text": text})
                 
-                # 評価と次の質問
                 phase = st.session_state.history[-2]["phase"]
                 eval_text = evaluate_response(last_q, text, st.session_state.cefr_level, phase)
                 st.session_state.history.append({"role": "grade", "text": eval_text})
@@ -324,7 +335,6 @@ elif st.session_state.exam_state == "interview":
                     next_q = get_opi_question(st.session_state.cefr_level, next_p, st.session_state.history, st.session_state.student_info, [], st.session_state.exam_config)
                     st.session_state.history.append({"role": "examiner", "text": next_q, "phase": next_p})
                     
-                    # 次の音声を生成
                     next_audio = text_to_speech(next_q)
                     st.session_state.latest_audio = next_audio
                     st.rerun()
@@ -332,9 +342,9 @@ elif st.session_state.exam_state == "interview":
                     st.session_state.exam_state = "finished"
                     st.rerun()
             else:
-                st.warning("音声が聞き取れませんでした。もう一度お願いします。")
+                st.warning("聞き取れませんでした。")
 
-# 3. 終了
+# 4. 終了
 elif st.session_state.exam_state == "finished":
     st.balloons()
     st.success("試験終了！")
@@ -343,6 +353,6 @@ elif st.session_state.exam_state == "finished":
         st.session_state.saved = True
         if ok: st.info(f"保存完了: {msg}")
     
-    if st.button("最初に戻る"):
+    if st.button("トップへ戻る"):
         st.session_state.clear()
         st.rerun()
