@@ -41,7 +41,7 @@ def configure_gemini():
 # --- 教科書読み込み ---
 @st.cache_resource
 def upload_textbook_to_gemini():
-    if not configure_gemini(): return [] # アップロード前にも認証
+    if not configure_gemini(): return [] 
     
     if not os.path.exists(MATERIALS_DIR): os.makedirs(MATERIALS_DIR)
     uploaded_files = []
@@ -49,7 +49,6 @@ def upload_textbook_to_gemini():
         if file.lower().endswith(".pdf"):
             try:
                 g_file = genai.upload_file(os.path.join(MATERIALS_DIR, file))
-                # 処理完了まで待機
                 while g_file.state.name == "PROCESSING": 
                     time.sleep(1)
                     g_file = genai.get_file(g_file.name)
@@ -58,32 +57,32 @@ def upload_textbook_to_gemini():
             except: pass
     return uploaded_files
 
-# --- 強力な生成関数 (自動リトライ・モデル切り替え) ---
+# --- 生成関数 (あなたの環境に合わせて2.0-flashを優先) ---
 def safe_generate_content(content_data):
-    # 生成の直前にも必ず認証を通す（これが重要）
     configure_gemini()
     
-    # 試行するモデルのリスト（診断で見つかった名前を優先）
+    # ★修正ポイント：診断画面にあったモデル名を最優先にする
     candidate_models = [
-        "models/gemini-1.5-flash",       # 最優先：完全修飾名
-        "gemini-1.5-flash",              # エイリアス
-        "models/gemini-1.5-flash-001",   # バージョン固定
-        "models/gemini-1.5-pro",         # フォールバック
-        "gemini-pro"                     # 最終手段
+        "models/gemini-2.0-flash",       # あなたのリストにあった最新モデル
+        "gemini-2.0-flash",              
+        "models/gemini-1.5-flash",       # バックアップ
+        "gemini-1.5-flash",
+        "models/gemini-pro"
     ]
     
     last_error = ""
     
     for model_name in candidate_models:
         try:
+            # 成功したらここでリターン
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(content_data)
-            return response.text # 成功したら即リターン
+            return response.text 
         except Exception as e:
             last_error = str(e)
             continue # 次のモデルを試す
             
-    return f"生成エラー: すべてのモデルで接続に失敗しました。\n詳細: {last_error}"
+    return f"生成エラー: すべてのモデル({candidate_models})で接続失敗。\n詳細: {last_error}"
 
 # --- Gemini 質問生成 ---
 def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
@@ -167,7 +166,6 @@ def save_result(student_info, level, exam_context, history):
         
         exam_name = f"{exam_context['year']} {exam_context['type']}" if exam_context['is_exam'] else "練習モード"
         
-        # 総評の生成
         summary = safe_generate_content([f"以下の会話ログから総評を100文字で:\n{str(history)}"])
         
         row = [
@@ -253,7 +251,6 @@ with st.sidebar:
                 st.warning("設定にはパスワードが必要です")
 
     st.divider()
-    # 初期化時に一度実行
     if configure_gemini():
         with st.spinner("資料読込中..."):
             textbooks = upload_textbook_to_gemini()
