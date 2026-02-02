@@ -80,8 +80,8 @@ def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
     3. 質問文のみを出力してください。
     """
     
-    # ★最新モデルを使用
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    # ★修正箇所：モデル名を変更
+    model = genai.GenerativeModel("gemini-1.5-flash-latest")
     content = [prompt]
     if textbook_files: content.extend(textbook_files)
     
@@ -91,8 +91,8 @@ def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
 
 # --- 評価生成 ---
 def evaluate_response(question, answer, cefr, phase):
-    # ★最新モデルを使用
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    # ★修正箇所：モデル名を変更
+    model = genai.GenerativeModel("gemini-1.5-flash-latest")
     prompt = f"""
     評価者として分析してください。
     目標: {cefr}, フェーズ: {phase}
@@ -139,8 +139,8 @@ def save_result(student_info, level, exam_context, history):
         
         exam_name = f"{exam_context['year']} {exam_context['type']}" if exam_context['is_exam'] else "練習モード"
         
-        # ★最新モデルを使用
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        # ★修正箇所：モデル名を変更
+        model = genai.GenerativeModel("gemini-1.5-flash-latest")
         summary = model.generate_content(f"以下の会話ログから総評を100文字で:\n{str(history)}").text
         
         row = [
