@@ -302,30 +302,50 @@ elif st.session_state.exam_state == "interview":
         audio_val = st.audio_input("録音ボタンを押して回答してください")
         if audio_val:
             with st.spinner("送信中..."):
+                # 一時ファイル作成
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
                     tmp.write(audio_val.getvalue())
-                    path = tmp.name
-                os.system(f'ffmpeg -y -i "{path}" -ac 1 -ar 16000 -ab 32k "{path}.mp3" -loglevel panic')
-                with open(f"{path}.mp3", "rb") as f: content = f.read()
-                text, err = speech_to_text(content)
-                os.remove(path); os.remove(f"{path}.mp3")
+                    webm_path = tmp.name
+                
+                mp3_path = webm_path + ".mp3"
+                
+                # FFmpegで変換
+                # -y: 上書き許可, -loglevel error: エラーのみ表示
+                cmd_res = os.system(f'ffmpeg -y -i "{webm_path}" -ac 1 -ar 16000 -ab 32k "{mp3_path}" -loglevel error')
+                
+                if cmd_res != 0 or not os.path.exists(mp3_path):
+                    st.error("音声変換に失敗しました。FFmpegがインストールされているか確認してください。")
+                else:
+                    with open(mp3_path, "rb") as f:
+                        content = f.read()
+                    
+                    text, err = speech_to_text(content)
+                    
+                    # 後始末
+                    try:
+                        os.remove(webm_path)
+                        os.remove(mp3_path)
+                    except:
+                        pass
 
-                if text:
-                    st.session_state.history.append({"role": "student", "text": text})
-                    last_q = st.session_state.history[-2]["text"]
-                    phase = st.session_state.history[-2]["phase"]
-                    eval_text = evaluate_response(last_q, text, st.session_state.cefr_level, phase)
-                    st.session_state.history.append({"role": "grade", "text": eval_text})
-                    st.session_state.phase_index += 1
-                    if st.session_state.phase_index < len(PHASE_ORDER):
-                        next_p = PHASE_ORDER[st.session_state.phase_index]
-                        next_q = get_opi_question(st.session_state.cefr_level, next_p, st.session_state.history, st.session_state.student_info, textbooks, st.session_state.exam_config)
-                        st.session_state.history.append({"role": "examiner", "text": next_q, "phase": next_p})
-                        st.rerun()
+                    if text:
+                        st.session_state.history.append({"role": "student", "text": text})
+                        last_q = st.session_state.history[-2]["text"]
+                        phase = st.session_state.history[-2]["phase"]
+                        eval_text = evaluate_response(last_q, text, st.session_state.cefr_level, phase)
+                        st.session_state.history.append({"role": "grade", "text": eval_text})
+                        st.session_state.phase_index += 1
+                        
+                        if st.session_state.phase_index < len(PHASE_ORDER):
+                            next_p = PHASE_ORDER[st.session_state.phase_index]
+                            next_q = get_opi_question(st.session_state.cefr_level, next_p, st.session_state.history, st.session_state.student_info, textbooks, st.session_state.exam_config)
+                            st.session_state.history.append({"role": "examiner", "text": next_q, "phase": next_p})
+                            st.rerun()
+                        else:
+                            st.session_state.exam_state = "finished"
+                            st.rerun()
                     else:
-                        st.session_state.exam_state = "finished"
-                        st.rerun()
-                else: st.error("音声が認識できませんでした。")
+                        st.error(f"音声認識エラー: {err}")
 
 # 3. 終了画面
 elif st.session_state.exam_state == "finished":
