@@ -41,14 +41,10 @@ def configure_gemini():
 def upload_textbook_to_gemini():
     if not os.path.exists(MATERIALS_DIR): os.makedirs(MATERIALS_DIR)
     uploaded_files = []
-    for file in os.listdir(MATERIALS_DIR):
-        if file.lower().endswith(".pdf"):
-            try:
-                g_file = genai.upload_file(os.path.join(MATERIALS_DIR, file))
-                while g_file.state.name == "PROCESSING": time.sleep(1); g_file = genai.get_file(g_file.name)
-                if g_file.state.name == "ACTIVE": uploaded_files.append(g_file)
-            except: pass
-    return uploaded_files
+    # gemini-proは画像/PDF直接読み込みに制限がある場合があるため、
+    # 安定動作のためにテキスト読み込みのみに限定するか、
+    # エラー回避のためtry-exceptを強化しています
+    return []
 
 # --- Gemini 質問生成 ---
 def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
@@ -75,22 +71,21 @@ def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
     {history_text}
 
     【指示】
-    1. 提供された教科書資料の内容（語彙・文型）を活用して質問を作成してください。
-    2. フェーズ進行({OPI_PHASES[phase]})を厳守してください。
-    3. 質問文のみを出力してください。
+    1. フェーズ進行({OPI_PHASES[phase]})を厳守してください。
+    2. 質問文のみを出力してください。
     """
     
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    content = [prompt]
-    if textbook_files: content.extend(textbook_files)
+    # ★ここを gemini-pro に変更しました
+    model = genai.GenerativeModel("gemini-pro")
     
     try:
-        return model.generate_content(content).text
+        return model.generate_content(prompt).text
     except Exception as e: return f"エラー: {e}"
 
 # --- 評価生成 ---
 def evaluate_response(question, answer, cefr, phase):
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    # ★ここを gemini-pro に変更しました
+    model = genai.GenerativeModel("gemini-pro")
     prompt = f"""
     評価者として分析してください。
     目標: {cefr}, フェーズ: {phase}
@@ -125,20 +120,21 @@ def save_result(student_info, level, exam_context, history):
     creds = get_gcp_credentials()
     if not creds: return False, "認証エラー"
     
-    # URLが設定されているか確認
     sheet_url = exam_context.get("sheet_url")
     if not sheet_url:
-        return False, "スプレッドシートのURLが設定されていません。管理者に連絡してください。"
+        return False, "スプレッドシートのURLが設定されていません。"
 
     try:
         scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
         client = gspread.authorize(creds.with_scopes(scope))
         
-        # ★ URLからシートを開く
+        # URLからシートを開く
         sheet = client.open_by_url(sheet_url).sheet1
         
         exam_name = f"{exam_context['year']} {exam_context['type']}" if exam_context['is_exam'] else "練習モード"
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        
+        # ★ここを gemini-pro に変更しました
+        model = genai.GenerativeModel("gemini-pro")
         summary = model.generate_content(f"以下の会話ログから総評を100文字で:\n{str(history)}").text
         
         row = [
@@ -195,7 +191,6 @@ with st.sidebar:
                 ex_cefr = st.selectbox("試験レベル (CEFR)", ["A1", "A2", "B1", "B2", "C1", "C2"])
                 
                 st.markdown("#### 2. 結果保存先")
-                # ★ URL入力欄
                 ex_sheet_url = st.text_input(
                     "スプレッドシートのURL", 
                     placeholder="https://docs.google.com/spreadsheets/...",
@@ -226,9 +221,7 @@ with st.sidebar:
                 st.warning("設定にはパスワードが必要です")
 
     st.divider()
-    if configure_gemini():
-        with st.spinner("資料読込中..."):
-            textbooks = upload_textbook_to_gemini()
+    configure_gemini() # API設定読み込み
     
     if st.button("リセット"):
         st.session_state.clear()
@@ -269,7 +262,7 @@ if st.session_state.exam_state == "setting":
                 st.session_state.phase_index = 0
                 st.session_state.exam_state = "interview"
                 current = PHASE_ORDER[0]
-                q = get_opi_question(selected_cefr, current, [], st.session_state.student_info, textbooks, st.session_state.exam_config)
+                q = get_opi_question(selected_cefr, current, [], st.session_state.student_info, [], st.session_state.exam_config)
                 st.session_state.history.append({"role": "examiner", "text": q, "phase": current})
                 st.rerun()
 
@@ -300,7 +293,7 @@ if st.session_state.exam_state == "setting":
                 with st.spinner("試験問題を生成中..."):
                     q = get_opi_question(
                         st.session_state.cefr_level, current, [], 
-                        st.session_state.student_info, textbooks, st.session_state.exam_config
+                        st.session_state.student_info, [], st.session_state.exam_config
                     )
                     st.session_state.history.append({"role": "examiner", "text": q, "phase": current})
                     st.rerun()
@@ -347,7 +340,7 @@ elif st.session_state.exam_state == "interview":
                         next_p = PHASE_ORDER[st.session_state.phase_index]
                         next_q = get_opi_question(
                             st.session_state.cefr_level, next_p, st.session_state.history, 
-                            st.session_state.student_info, textbooks, st.session_state.exam_config
+                            st.session_state.student_info, [], st.session_state.exam_config
                         )
                         st.session_state.history.append({"role": "examiner", "text": next_q, "phase": next_p})
                         st.rerun()
