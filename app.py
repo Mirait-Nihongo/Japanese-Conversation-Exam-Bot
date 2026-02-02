@@ -10,7 +10,40 @@ import gspread
 
 # --- ページ設定 ---
 st.set_page_config(page_title="日本語会話試験システム", page_icon="🏫", layout="wide")
+# --- ⬇️ ここから診断コード ---
+st.divider()
+st.subheader("🔍 システム診断モード")
 
+# 1. APIキーが読み込めているか確認
+if "GEMINI_API_KEY" in st.secrets:
+    raw_key = st.secrets["GEMINI_API_KEY"]
+    # キーの最初と最後だけ表示（セキュリティのため）
+    safe_key = f"{raw_key[:5]}...{raw_key[-5:]}" if len(raw_key) > 10 else "短い/不正"
+    st.write(f"✅ APIキー認識: {safe_key} (文字数: {len(raw_key)})")
+    
+    # 2. 実際にGoogleに接続テスト
+    try:
+        genai.configure(api_key=raw_key)
+        models = list(genai.list_models())
+        st.write("✅ Google接続成功！利用可能なモデル一覧:")
+        found_flash = False
+        for m in models:
+            if "gemini" in m.name:
+                st.code(m.name) # ここに gemini-1.5-flash があるか確認
+                if "flash" in m.name: found_flash = True
+        
+        if found_flash:
+            st.success("🎉 Gemini Flash が見つかりました！システムは正常です。")
+        else:
+            st.error("⚠️ 接続はできましたが、Flashモデルの権限がありません。")
+            
+    except Exception as e:
+        st.error(f"❌ API接続エラー: {e}")
+        st.info("ヒント: キーが無効か、Google AI Studioで作成されていません。")
+else:
+    st.error("❌ APIキーが Secrets に設定されていません！")
+st.divider()
+# --- ⬆️ ここまで診断コード ---
 # --- 定数・初期設定 ---
 MATERIALS_DIR = "materials"
 OPI_PHASES = {
