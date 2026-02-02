@@ -1,0 +1,6 @@
+streamlit
+google-cloud-speech
+google-generativeai
+gspread
+oauth2client
+requests
