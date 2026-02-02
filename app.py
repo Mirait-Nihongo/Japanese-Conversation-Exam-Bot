@@ -163,7 +163,7 @@ def save_result(student_info, level, exam_context, history):
     creds = get_gcp_credentials()
     if not creds: return False, "認証エラー"
     sheet_url = exam_context.get("sheet_url")
-    if not sheet_url: return False, "URL未設定" # ★ここの引用符を修正しました
+    if not sheet_url: return False, "URL未設定"
 
     try:
         scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
@@ -192,6 +192,8 @@ if "exam_state" not in st.session_state: st.session_state.exam_state = "setting"
 if "phase_index" not in st.session_state: st.session_state.phase_index = 0
 if "exam_config" not in st.session_state: st.session_state.exam_config = {"is_exam": False}
 if "latest_audio" not in st.session_state: st.session_state.latest_audio = None
+# 認識結果の一時保存用（キーを変数で管理するため）
+if "current_transcript" not in st.session_state: st.session_state.current_transcript = ""
 
 # --- サイドバー ---
 with st.sidebar:
@@ -291,61 +293,69 @@ elif st.session_state.exam_state == "interview":
             st.write(f"{role}: {chat['text']}")
 
     st.markdown("---")
-    st.write("👇 **マイクボタンを押して録音を開始し、終わったら停止ボタンを押してください**")
     
-    # マイク入力
-    audio_val = st.audio_input("回答を録音")
+    # ★重要: フェーズごとに異なるキーを使うことで、マイクコンポーネントを強制リセットする
+    # これにより、次の質問に移ったときに前の録音が消えます
+    current_key = f"audio_recorder_{st.session_state.phase_index}"
     
+    # 録音ウィジェット
+    audio_val = st.audio_input("録音 (クリックして開始/停止)", key=current_key)
+    
+    # 音声がある場合、即座に文字起こしする
     if audio_val:
-        # すでにテキスト変換済みかチェック
-        if "temp_text" not in st.session_state:
-            with st.spinner("音声を文字に変換中..."):
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
-                    tmp.write(audio_val.getvalue())
-                    webm_path = tmp.name
-                mp3_path = webm_path + ".mp3"
-                os.system(f'ffmpeg -y -i "{webm_path}" -ac 1 -ar 16000 -ab 32k "{mp3_path}" -loglevel quiet')
-                
-                with open(mp3_path, "rb") as f: content = f.read()
-                text, err = speech_to_text(content)
-                try: os.remove(webm_path); os.remove(mp3_path)
-                except: pass
-                
-                if text:
-                    st.session_state.temp_text = text
-                else:
-                    st.error("うまく聞き取れませんでした。もう一度録音してください。")
-        
-        # 変換されたテキストがあれば、確認ボタンを表示
-        if "temp_text" in st.session_state:
-            st.success(f"🗣️ **あなたの回答:** {st.session_state.temp_text}")
+        # すでに文字起こし済みでない場合のみ処理
+        with st.spinner("音声を文字に変換中..."):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+                tmp.write(audio_val.getvalue())
+                webm_path = tmp.name
+            mp3_path = webm_path + ".mp3"
+            os.system(f'ffmpeg -y -i "{webm_path}" -ac 1 -ar 16000 -ab 32k "{mp3_path}" -loglevel quiet')
             
-            col_a, col_b = st.columns([1,1])
-            with col_a:
-                if st.button("✅ この内容で回答する", type="primary", use_container_width=True):
-                    text = st.session_state.temp_text
-                    del st.session_state.temp_text 
-                    
-                    st.session_state.history.append({"role": "student", "text": text})
-                    
-                    # 履歴依存ではなく、現在のフェーズ順序から取得 (KeyError対策済み)
-                    current_phase_key = PHASE_ORDER[st.session_state.phase_index]
-                    
-                    eval_text = evaluate_response(last_q, text, st.session_state.cefr_level, current_phase_key)
-                    st.session_state.history.append({"role": "grade", "text": eval_text})
-                    
-                    st.session_state.phase_index += 1
-                    if st.session_state.phase_index < len(PHASE_ORDER):
-                        next_p = PHASE_ORDER[st.session_state.phase_index]
-                        next_q = get_opi_question(st.session_state.cefr_level, next_p, st.session_state.history, st.session_state.student_info, [], st.session_state.exam_config)
-                        st.session_state.history.append({"role": "examiner", "text": next_q, "phase": next_p})
-                        
-                        next_audio = text_to_speech(next_q)
-                        st.session_state.latest_audio = next_audio
-                        st.rerun()
-                    else:
-                        st.session_state.exam_state = "finished"
-                        st.rerun()
+            with open(mp3_path, "rb") as f: content = f.read()
+            text, err = speech_to_text(content)
+            try: os.remove(webm_path); os.remove(mp3_path)
+            except: pass
+            
+            if text:
+                st.session_state.current_transcript = text
+            else:
+                st.error("聞き取れませんでした。もう一度録音してください。")
+    
+    # 文字起こし結果がある場合、解答ボタンを表示
+    if st.session_state.current_transcript:
+        st.success(f"🗣️ **あなたの回答:** {st.session_state.current_transcript}")
+        
+        # 解答ボタン
+        if st.button("✅ 解答する (次へ)", type="primary"):
+            # 回答を確定
+            final_text = st.session_state.current_transcript
+            st.session_state.current_transcript = "" # 一時データをクリア
+            
+            st.session_state.history.append({"role": "student", "text": final_text})
+            
+            # 現在のフェーズを取得
+            current_phase_key = PHASE_ORDER[st.session_state.phase_index]
+            
+            # 評価生成
+            eval_text = evaluate_response(last_q, final_text, st.session_state.cefr_level, current_phase_key)
+            st.session_state.history.append({"role": "grade", "text": eval_text})
+            
+            # フェーズ進行
+            st.session_state.phase_index += 1
+            
+            if st.session_state.phase_index < len(PHASE_ORDER):
+                next_p = PHASE_ORDER[st.session_state.phase_index]
+                next_q = get_opi_question(st.session_state.cefr_level, next_p, st.session_state.history, st.session_state.student_info, [], st.session_state.exam_config)
+                st.session_state.history.append({"role": "examiner", "text": next_q, "phase": next_p})
+                
+                next_audio = text_to_speech(next_q)
+                st.session_state.latest_audio = next_audio
+                # rerunすることで、key="audio_recorder_{index}" が新しいIDになり、
+                # 自動的にマイク入力がリセット（クリア）されます。
+                st.rerun()
+            else:
+                st.session_state.exam_state = "finished"
+                st.rerun()
 
 # 4. 終了
 elif st.session_state.exam_state == "finished":
