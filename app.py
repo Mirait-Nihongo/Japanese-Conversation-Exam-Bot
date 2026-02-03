@@ -197,11 +197,16 @@ def ask_gemini(student_name, nationality, text, alts, details):
 # --- メイン画面 ---
 st.info("👇 学習者の情報を入力してください")
 
+# ★★★ ここで入力欄を2つに分けています ★★★
 col1, col2 = st.columns(2)
+
 with col1:
     student_name = st.text_input("学習者氏名", placeholder="例: ジョン・スミス")
+
 with col2:
+    # ここに国籍入力欄が表示されます
     nationality = st.text_input("母語・国籍 (分析に必須)", placeholder="例: ベトナム語、中国語、英語")
+# ★★★★★★★★★★★★★★★★★★★★★
 
 tab1, tab2 = st.tabs(["📁 ファイルをアップロード", "🎙️ その場で録音する"])
 
@@ -223,6 +228,7 @@ with tab2:
 if st.button("🚀 専門分析を開始する", type="primary"):
     if target_audio:
         with st.spinner('🎧 対照言語学的分析を実行中...'):
+            # バイトデータ取得
             audio_bytes = target_audio.getvalue()
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_audio:
