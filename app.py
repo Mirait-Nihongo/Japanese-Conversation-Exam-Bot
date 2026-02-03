@@ -1,296 +1,422 @@
 import streamlit as st
 import os
-import io
+import time
 import tempfile
 import datetime
-import base64
 import google.generativeai as genai
 from google.cloud import speech
+from google.cloud import texttospeech
 from google.oauth2 import service_account
+import gspread
+import importlib.metadata
 
-# --- 設定 ---
-st.set_page_config(page_title="日本語発音 指導補助ツール v2", page_icon="👨‍🏫", layout="centered")
-st.title("👨‍🏫 日本語発音 指導補助ツール v2") # ★タイトルを変えました（更新確認用）
-st.markdown("教師向け：対照言語学に基づく発音診断・誤用分析")
+# --- ページ設定 ---
+st.set_page_config(page_title="日本語会話試験システム", page_icon="🎙️", layout="wide")
 
-# --- 認証情報の読み込み ---
+# --- 定数・初期設定 ---
+MATERIALS_DIR = "materials"
+OPI_PHASES = {
+"warmup": "導入 (Warm-up)",
+"level_check": "レベルチェック",
+"probe": "突き上げ (Probe)",
+"wind_down": "終結 (Wind-down)"
+}
+PHASE_ORDER = ["warmup", "level_check", "level_check", "probe", "wind_down"]
+
+# 管理者パスワード
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
+
+# --- 認証関係 ---
+def get_gcp_credentials():
+if "gcp_service_account" in st.secrets:
+return service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
+return None
+
+def configure_gemini():
+if "GEMINI_API_KEY" in st.secrets:
+genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+return True
+return False
+
+# --- 教科書読み込み ---
+@st.cache_resource
+def upload_textbook_to_gemini():
+if not configure_gemini(): return [] 
+if not os.path.exists(MATERIALS_DIR): os.makedirs(MATERIALS_DIR)
+uploaded_files = []
+for file in os.listdir(MATERIALS_DIR):
+if file.lower().endswith(".pdf"):
 try:
-    gemini_api_key = st.secrets["GEMINI_API_KEY"]
-    google_json_str = st.secrets["GOOGLE_JSON"]
-    
-    genai.configure(api_key=gemini_api_key)
-    
-    with open("google_key.json", "w") as f:
-        f.write(google_json_str)
-    json_path = "google_key.json"
+g_file = genai.upload_file(os.path.join(MATERIALS_DIR, file))
+while g_file.state.name == "PROCESSING": 
+time.sleep(1)
+g_file = genai.get_file(g_file.name)
+if g_file.state.name == "ACTIVE": 
+uploaded_files.append(g_file)
+except: pass
+return uploaded_files
+
+# --- AI生成関数 (Gemini 2.0 Flash優先) ---
+def safe_generate_content(content_data):
+configure_gemini()
+candidate_models = [
+"models/gemini-2.0-flash",       
+"gemini-2.0-flash",              
+"models/gemini-1.5-flash",       
+"models/gemini-pro"
+]
+last_error = ""
+for model_name in candidate_models:
+try:
+model = genai.GenerativeModel(model_name)
+response = model.generate_content(content_data)
+return response.text 
 except Exception as e:
-    st.error("⚠️ 設定エラー: Secretsの設定を確認してください。")
-    st.stop()
+last_error = str(e)
+continue
+return f"生成エラー: 接続失敗。詳細: {last_error}"
 
-# --- 関数群 ---
+# --- 音声合成 (Text-to-Speech) ---
+def text_to_speech(text):
+creds = get_gcp_credentials()
+if not creds: return None
 
-def get_sticky_audio_player(audio_bytes):
-    """音声データをBase64に変換して、画面下に固定されるHTMLプレーヤーを作る"""
-    b64 = base64.b64encode(audio_bytes).decode()
-    md = f"""
-        <style>
-            .sticky-audio {{
-                position: fixed;
-                bottom: 0;
-                left: 0;
-                width: 100%;
-                background-color: #f0f2f6;
-                padding: 10px 20px;
-                z-index: 99999;
-                border-top: 1px solid #ccc;
-                text-align: center;
-                box-shadow: 0px -2px 10px rgba(0,0,0,0.1);
-            }}
-            .main .block-container {{
-                padding-bottom: 100px;
-            }}
-        </style>
-        <div class="sticky-audio">
-            <div style="margin-bottom:5px; font-weight:bold; font-size:0.9em; color:#333;">
-                🔊 録音データ再生（診断カルテを見ながら聞いてください）
-            </div>
-            <audio controls src="data:audio/mp3;base64,{b64}" style="width: 100%; max-width: 600px;"></audio>
-        </div>
-    """
-    return md
+client = texttospeech.TextToSpeechClient(credentials=creds)
+synthesis_input = texttospeech.SynthesisInput(text=text)
 
-def analyze_audio(audio_path):
-    try:
-        credentials = service_account.Credentials.from_service_account_file(json_path)
-        client = speech.SpeechClient(credentials=credentials)
-    except Exception as e:
-        return {"error": f"認証エラー: {e}"}
+voice = texttospeech.VoiceSelectionParams(
+language_code="ja-JP",
+name="ja-JP-Neural2-B" 
+)
 
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_converted:
-        converted_path = tmp_converted.name
-    
-    cmd = f'ffmpeg -y -i "{audio_path}" -ac 1 -ar 16000 -ab 32k "{converted_path}" -loglevel panic'
-    exit_code = os.system(cmd)
-    
-    if exit_code != 0:
-        return {"error": "音声変換エラー"}
+audio_config = texttospeech.AudioConfig(
+audio_encoding=texttospeech.AudioEncoding.MP3
+)
 
-    with io.open(converted_path, "rb") as f:
-        content = f.read()
-    
-    try:
-        audio = speech.RecognitionAudio(content=content)
-        config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED,
-            sample_rate_hertz=16000,
-            language_code="ja-JP",
-            enable_automatic_punctuation=False,
-            max_alternatives=5, 
-            enable_word_confidence=True
-        )
-        operation = client.long_running_recognize(config=config, audio=audio)
-        response = operation.result(timeout=600)
-    except Exception as e:
-        return {"error": f"認識エラー: {e}"}
-    finally:
-        if os.path.exists(converted_path): os.remove(converted_path)
+try:
+response = client.synthesize_speech(
+input=synthesis_input, voice=voice, audio_config=audio_config
+)
+return response.audio_content
+except Exception as e:
+st.error(f"音声合成エラー: {e}")
+return None
 
-    if not response.results:
-        return {"error": "音声認識不可(無音/ノイズ)"}
+# --- Gemini 質問生成 ---
+def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
+history_text = "\n".join([f"{h['role']}: {h['text']}" for h in history if h['role'] in ['examiner', 'student']])
 
-    result = response.results[0]
-    alt = result.alternatives[0]
-    all_candidates = [a.transcript for a in result.alternatives]
-    
-    details_list = []
-    for w in alt.words:
-        score = int(w.confidence * 100)
-        marker = " ⚠️" if w.confidence < 0.8 else ""
-        details_list.append(f"{w.word}({score}){marker}")
-    
-    formatted_details = ", ".join(details_list)
+mode_instruction = ""
+if exam_context["is_exam"]:
+mode_instruction = f"これは試験です。対象: {exam_context['class']}。厳格に。"
+else:
+mode_instruction = "これは練習モードです。優しく会話をリードしてください。"
 
-    return {
-        "main_text": alt.transcript,
-        "alts": ", ".join(all_candidates),
-        "details": formatted_details
-    }
+prompt = f"""
+   あなたは日本語会話の先生です。
+   {mode_instruction}
+   相手: {info['name']} (目標: {cefr})
+   フェーズ: {OPI_PHASES[phase]}
+   
+   【履歴】
+   {history_text}
 
-def ask_gemini(student_name, nationality, text, alts, details):
-    try:
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-        
-        if not available_models:
-            return "❌ エラー: 利用可能なGeminiモデルが見つかりません。"
+   【指示】
+   短く自然な日本語で質問してください（50文字以内推奨）。
+   質問のみを出力してください。
+   """
 
-        target_model = available_models[0]
-        for m in available_models:
-            if "gemini-1.5-flash" in m:
-                target_model = m
-                break
-            elif "gemini-pro" in m:
-                target_model = m
-        
-        model = genai.GenerativeModel(target_model)
-        
-        name_part = f"学習者名は「{student_name}」です。" if student_name else "学習者名は不明です。"
-        
-        if nationality:
-            nat_instruction = f"学習者の母語・国籍は「{nationality}」です。この言語と日本語の対照言語学的視点から分析してください。"
-        else:
-            nat_instruction = "母語情報は不明です。一般的な誤用分析を行ってください。"
+content = [prompt]
+if textbook_files: content.extend(textbook_files)
 
-        prompt = f"""
-        あなたは日本語音声学・対照言語学・日本語教育の高度な専門家です。
-        以下の音声認識データに基づき、教師が指導に活用するための詳細な「発音診断カルテ」を作成してください。
+return safe_generate_content(content)
 
-        【基本情報】
-        {name_part}
-        {nat_instruction}
-        
-        【分析対象データ】
-        ※データ内の「⚠️」は、機械判定の信頼度が低い（不明瞭または誤音の可能性が高い）箇所です。
-        1. 認識結果: {text}
-        2. 揺れ(別候補): {alts}
-        3. 詳細スコア: {details}
+# --- 評価生成 ---
+def evaluate_response(question, answer, cefr, phase):
+prompt = f"""
+   評価者として分析。
+   目標:{cefr}, 質問:{question}, 回答:{answer}
+   出力: Markdown箇条書きで 1.レベル判定 2.正確さ 3.助言
+   """
+return safe_generate_content([prompt])
 
-        【必須分析項目】
-        以下の5つの観点を必ず含めてレポートを作成してください。
+# --- 音声認識 ---
+def speech_to_text(audio_bytes):
+creds = get_gcp_credentials()
+if not creds: return None, "認証エラー"
+client = speech.SpeechClient(credentials=creds)
+config = speech.RecognitionConfig(
+encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED,
+sample_rate_hertz=16000,
+language_code="ja-JP",
+enable_automatic_punctuation=True
+)
+try:
+audio = speech.RecognitionAudio(content=audio_bytes)
+res = client.recognize(config=config, audio=audio)
+if not res.results: return None, "聞き取れませんでした"
+return res.results[0].alternatives[0].transcript, None
+except Exception as e: return None, str(e)
 
-        1. **音韻体系の対照分析**
-           - {nationality if nationality else "学習者の母語"}の音韻体系と日本語の相違点に基づく全体的傾向
-        
-        2. **母語にない・区別されない日本語音**
-           - 母語に存在しないため代用されている音、統合されてしまっている音の指摘
-           - (例: 清濁、有気・無気、特定の母音など)
+# --- 保存処理 ---
+def save_result(student_info, level, exam_context, history):
+creds = get_gcp_credentials()
+if not creds: return False, "認証エラー"
+sheet_url = exam_context.get("sheet_url")
+    if not sheet_url: return False, "URL未設定" # ★ここの引用符を修正しました
+    if not sheet_url: return False, "URL未設定"
 
-        3. **調音位置・調音方法のずれ**
-           - 具体的な調音点（舌の位置、唇の形）や調音方法（閉鎖、摩擦の強さ）の誤り
-           - ⚠️が付いている箇所を中心に、どのような物理的ズレが起きているか推測してください
+try:
+scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+client = gspread.authorize(creds.with_scopes(scope))
+sheet = client.open_by_url(sheet_url).sheet1
 
-        4. **知覚上の誤認（聞き分けの問題）**
-           - 発音の誤りが「音を聞き分けられていない」ことに起因する可能性の分析
-           - 「揺れ（別候補）」データから、学習者がどの音と混同しているか分析
+exam_name = f"{exam_context['year']} {exam_context['type']}" if exam_context['is_exam'] else "練習"
+summary = safe_generate_content([f"会話ログから総評を100文字で:\n{str(history)}"])
 
-        5. **日本語特有のプロソディ**
-           - 拍（モーラ）感覚、長音、促音（っ）、撥音（ん）のリズム
-           - ピッチアクセントとイントネーションの自然さ
+row = [
+datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), 
+exam_name, exam_context.get('class', '-'), student_info['class'],
+student_info['id'], student_info['name'], level, summary
+]
+sheet.append_row(row)
+return True, summary
+except Exception as e: return False, str(e)
 
-        【出力形式】
-        見出しを付けて構造化し、専門用語には教師向けの簡単な補足を加えてください。
-        最後に「最優先指導計画」を提案してください。
-        """
-        response = model.generate_content(prompt)
-        return response.text
 
-    except Exception as e:
-        return f"❌ 予期せぬエラー: {e}"
+# ==========================================
+# UI & ロジック
+# ==========================================
 
-# --- メイン画面 ---
-st.info("👇 学習者の情報を入力してください")
+if "history" not in st.session_state: st.session_state.history = []
+if "exam_state" not in st.session_state: st.session_state.exam_state = "setting"
+if "phase_index" not in st.session_state: st.session_state.phase_index = 0
+if "exam_config" not in st.session_state: st.session_state.exam_config = {"is_exam": False}
+if "latest_audio" not in st.session_state: st.session_state.latest_audio = None
+# 認識結果の一時保存用（キーを変数で管理するため）
+if "current_transcript" not in st.session_state: st.session_state.current_transcript = ""
 
-# ★★★ ここが入力欄を2つにするコードです ★★★
-col1, col2 = st.columns(2)
+# --- サイドバー ---
+with st.sidebar:
+st.header("⚙️ システム設定")
+mode = st.radio("モード", ["🐣 練習モード", "📝 試験モード"], index=0 if not st.session_state.exam_config["is_exam"] else 1)
 
-with col1:
-    student_name = st.text_input("学習者氏名", placeholder="例: ジョン・スミス")
+if mode == "🐣 練習モード":
+st.session_state.exam_config = {"is_exam": False}
+st.info("AIが声で話しかけます。")
 
+elif mode == "📝 試験モード":
+st.divider()
+pwd = st.text_input("管理者パスワード", type="password")
+if pwd == ADMIN_PASSWORD:
+with st.form("exam_settings"):
+ex_year = st.number_input("年度", value=2025)
+ex_type = st.selectbox("種別", ["中間", "期末"])
+ex_class = st.text_input("クラス")
+ex_cefr = st.selectbox("レベル", ["A1", "A2", "B1", "B2"])
+ex_url = st.text_input("シートURL")
+
+if st.form_submit_button("設定"):
+st.session_state.exam_config = {
+"is_exam": True, "year": ex_year, "type": ex_type,
+"class": ex_class, "level": ex_cefr, "sheet_url": ex_url
+}
+st.session_state.exam_state = "setting"
+st.session_state.history = []
+st.rerun()
+
+st.divider()
+if configure_gemini():
+upload_textbook_to_gemini()
+if st.button("リセット"):
+st.session_state.clear()
+st.rerun()
+
+# --- メインエリア ---
+if st.session_state.exam_config["is_exam"]:
+conf = st.session_state.exam_config
+st.title(f"📝 {conf['year']} {conf['type']}")
+else:
+st.title("🗣️ 日本語会話 (Gemini Live Mode)")
+
+# 1. 設定画面
+if st.session_state.exam_state == "setting":
+st.markdown("### 受験者情報を入力してください")
+c1, c2, c3 = st.columns(3)
+with c1: s_class = st.text_input("クラス")
+with c2: s_id = st.text_input("番号")
+with c3: s_name = st.text_input("氏名")
+
+if s_name:
+if st.button("確認して次へ", type="primary"):
+st.session_state.student_info = {"name": s_name, "class": s_class, "id": s_id}
+st.session_state.cefr_level = st.session_state.exam_config.get("level", "A2")
+st.session_state.phase_index = 0
+st.session_state.exam_state = "ready"
+st.rerun()
+
+# 2. 開始待機画面
+elif st.session_state.exam_state == "ready":
+st.markdown(f"## こんにちは、{st.session_state.student_info['name']} さん。")
+st.divider()
+col1, col2, col3 = st.columns([1, 2, 1])
 with col2:
-    nationality = st.text_input("母語・国籍 (分析に必須)", placeholder="例: ベトナム語、中国語、英語")
-# ★★★★★★★★★★★★★★★★★★★★★★★
+if st.button("🔴 試験を開始する", type="primary", use_container_width=True):
+st.session_state.exam_state = "interview"
+current = PHASE_ORDER[0]
+with st.spinner("AIが質問を生成しています..."):
+q = get_opi_question(st.session_state.cefr_level, current, [], st.session_state.student_info, [], st.session_state.exam_config)
+st.session_state.history.append({"role": "examiner", "text": q, "phase": current})
+audio_data = text_to_speech(q)
+st.session_state.latest_audio = audio_data
+st.rerun()
 
-tab1, tab2 = st.tabs(["📁 ファイルをアップロード", "🎙️ その場で録音する"])
+# 3. 会話画面
+elif st.session_state.exam_state == "interview":
+# 進捗バー
+prog = (st.session_state.phase_index + 1) / len(PHASE_ORDER)
+st.progress(prog)
 
-target_audio = None 
+last_q = st.session_state.history[-1]["text"]
 
-with tab1:
-    uploaded_file = st.file_uploader("音声ファイルを選択 (mp3, wav, m4a)", type=["mp3", "wav", "m4a"])
-    if uploaded_file:
-        st.audio(uploaded_file)
-        target_audio = uploaded_file
+st.markdown(f"""
+   <div style="background-color:#e8f0fe;padding:20px;border-radius:10px;margin-bottom:20px;">
+       <h3 style="margin:0;">👮 先生: {last_q}</h3>
+   </div>
+   """, unsafe_allow_html=True)
 
-with tab2:
-    st.write("ボタンを押して話し、終わったら停止ボタンを押してください。")
-    recorded_audio = st.audio_input("録音開始")
-    if recorded_audio:
-        target_audio = recorded_audio
+if st.session_state.latest_audio:
+st.audio(st.session_state.latest_audio, format="audio/mp3", autoplay=True)
 
-# --- 分析ボタン ---
-if st.button("🚀 専門分析を開始する", type="primary"):
-    if target_audio:
-        with st.spinner('🎧 対照言語学的分析を実行中...'):
-            audio_bytes = target_audio.getvalue()
+with st.expander("これまでの会話履歴"):
+for chat in st.session_state.history[:-1]:
+role = "👮" if chat["role"]=="examiner" else "🧑‍🎓"
+st.write(f"{role}: {chat['text']}")
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_audio:
-                tmp_audio.write(audio_bytes)
-                tmp_audio_path = tmp_audio.name
+st.markdown("---")
+    st.write("👇 **マイクボタンを押して録音を開始し、終わったら停止ボタンを押してください**")
+
+    # マイク入力
+    audio_val = st.audio_input("回答を録音")
+    # ★重要: フェーズごとに異なるキーを使うことで、マイクコンポーネントを強制リセットする
+    # これにより、次の質問に移ったときに前の録音が消えます
+    current_key = f"audio_recorder_{st.session_state.phase_index}"
+
+    # 録音ウィジェット
+    audio_val = st.audio_input("録音 (クリックして開始/停止)", key=current_key)
+    
+    # 音声がある場合、即座に文字起こしする
+if audio_val:
+        # すでにテキスト変換済みかチェック
+        if "temp_text" not in st.session_state:
+            with st.spinner("音声を文字に変換中..."):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+                    tmp.write(audio_val.getvalue())
+                    webm_path = tmp.name
+                mp3_path = webm_path + ".mp3"
+                os.system(f'ffmpeg -y -i "{webm_path}" -ac 1 -ar 16000 -ab 32k "{mp3_path}" -loglevel quiet')
+                
+                with open(mp3_path, "rb") as f: content = f.read()
+                text, err = speech_to_text(content)
+                try: os.remove(webm_path); os.remove(mp3_path)
+                except: pass
+                
+                if text:
+                    st.session_state.temp_text = text
+                else:
+                    st.error("うまく聞き取れませんでした。もう一度録音してください。")
+        # すでに文字起こし済みでない場合のみ処理
+        with st.spinner("音声を文字に変換中..."):
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+                tmp.write(audio_val.getvalue())
+                webm_path = tmp.name
+            mp3_path = webm_path + ".mp3"
+            os.system(f'ffmpeg -y -i "{webm_path}" -ac 1 -ar 16000 -ab 32k "{mp3_path}" -loglevel quiet')
             
-            res = analyze_audio(tmp_audio_path)
+            with open(mp3_path, "rb") as f: content = f.read()
+            text, err = speech_to_text(content)
+            try: os.remove(webm_path); os.remove(mp3_path)
+            except: pass
             
-            if "error" in res:
-                st.error(res["error"])
+            if text:
+                st.session_state.current_transcript = text
             else:
-                st.success("解析完了")
+                st.error("聞き取れませんでした。もう一度録音してください。")
+    
+    # 文字起こし結果がある場合、解答ボタンを表示
+    if st.session_state.current_transcript:
+        st.success(f"🗣️ **あなたの回答:** {st.session_state.current_transcript}")
 
-                # 固定プレーヤー
-                player_html = get_sticky_audio_player(audio_bytes)
-                st.markdown(player_html, unsafe_allow_html=True)
+        # 変換されたテキストがあれば、確認ボタンを表示
+        if "temp_text" in st.session_state:
+            st.success(f"🗣️ **あなたの回答:** {st.session_state.temp_text}")
+        # 解答ボタン
+        if st.button("✅ 解答する (次へ)", type="primary"):
+            # 回答を確定
+            final_text = st.session_state.current_transcript
+            st.session_state.current_transcript = "" # 一時データをクリア
 
-                st.subheader("🗣️ 音声認識データ")
-                st.code(res["main_text"], language=None)
+            col_a, col_b = st.columns([1,1])
+            with col_a:
+                if st.button("✅ この内容で回答する", type="primary", use_container_width=True):
+                    text = st.session_state.temp_text
+                    del st.session_state.temp_text 
+                    
+                    st.session_state.history.append({"role": "student", "text": text})
+                    
+                    # 履歴依存ではなく、現在のフェーズ順序から取得 (KeyError対策済み)
+                    current_phase_key = PHASE_ORDER[st.session_state.phase_index]
+                    
+                    eval_text = evaluate_response(last_q, text, st.session_state.cefr_level, current_phase_key)
+                    st.session_state.history.append({"role": "grade", "text": eval_text})
+                    
+                    st.session_state.phase_index += 1
+                    if st.session_state.phase_index < len(PHASE_ORDER):
+                        next_p = PHASE_ORDER[st.session_state.phase_index]
+                        next_q = get_opi_question(st.session_state.cefr_level, next_p, st.session_state.history, st.session_state.student_info, [], st.session_state.exam_config)
+                        st.session_state.history.append({"role": "examiner", "text": next_q, "phase": next_p})
+                        
+                        next_audio = text_to_speech(next_q)
+                        st.session_state.latest_audio = next_audio
+                        st.rerun()
+                    else:
+                        st.session_state.exam_state = "finished"
+                        st.rerun()
+            st.session_state.history.append({"role": "student", "text": final_text})
+            
+            # 現在のフェーズを取得
+            current_phase_key = PHASE_ORDER[st.session_state.phase_index]
+            
+            # 評価生成
+            eval_text = evaluate_response(last_q, final_text, st.session_state.cefr_level, current_phase_key)
+            st.session_state.history.append({"role": "grade", "text": eval_text})
+            
+            # フェーズ進行
+            st.session_state.phase_index += 1
+            
+            if st.session_state.phase_index < len(PHASE_ORDER):
+                next_p = PHASE_ORDER[st.session_state.phase_index]
+                next_q = get_opi_question(st.session_state.cefr_level, next_p, st.session_state.history, st.session_state.student_info, [], st.session_state.exam_config)
+                st.session_state.history.append({"role": "examiner", "text": next_q, "phase": next_p})
                 
-                with st.expander("🔍 分析用生データ (教師用)", expanded=True):
-                    st.write("※スコアが80未満の箇所には ⚠️ が付いています")
-                    st.write(f"信頼度詳細: {res['details']}")
-                    st.write(f"別候補: {res['alts']}")
+                next_audio = text_to_speech(next_q)
+                st.session_state.latest_audio = next_audio
+                # rerunすることで、key="audio_recorder_{index}" が新しいIDになり、
+                # 自動的にマイク入力がリセット（クリア）されます。
+                st.rerun()
+            else:
+                st.session_state.exam_state = "finished"
+                st.rerun()
 
-                st.markdown("---")
-                
-                title_suffix = f" ({nationality})" if nationality else ""
-                name_display = student_name if student_name else "学習者"
-                st.subheader(f"📝 {name_display}さんの発音診断カルテ{title_suffix}")
-                
-                report_content = ask_gemini(student_name, nationality, res["main_text"], res["alts"], res["details"])
-                st.markdown(report_content)
-                
-                today_str = datetime.datetime.now().strftime('%Y-%m-%d')
-                safe_name = student_name if student_name else "student"
-                safe_nat = nationality if nationality else "unknown"
-                
-                download_text = f"""================================
-日本語発音診断レポート
-================================
-■ 実施日: {today_str}
-■ 学習者: {safe_name}
-■ 母語・国籍: {safe_nat}
+# 4. 終了
+elif st.session_state.exam_state == "finished":
+st.balloons()
+st.success("試験終了！")
+if "saved" not in st.session_state:
+ok, msg = save_result(st.session_state.student_info, st.session_state.cefr_level, st.session_state.exam_config, st.session_state.history)
+st.session_state.saved = True
+if ok: st.info(f"保存完了: {msg}")
 
-【音声認識結果】
-{res['main_text']}
-
-【詳細スコア (信頼度)】
-※80点未満は ⚠️ マーク付き
-{res['details']}
-
-【認識候補の揺れ】
-{res['alts']}
-
---------------------------------
-【AI講師による詳細診断（5つの観点）】
---------------------------------
-{report_content}
-"""
-                file_name = f"{safe_name}_{today_str}_report.txt"
-
-                st.download_button(
-                    label="📥 診断結果をテキストで保存",
-                    data=download_text,
-                    file_name=file_name,
-                    mime="text/plain"
-                )
-
-            if os.path.exists(tmp_audio_path): os.remove(tmp_audio_path)
-    else:
-        st.warning("音声ファイルを選択するか、録音してください。")
+if st.button("トップへ戻る"):
+st.session_state.clear()
+st.rerun()
