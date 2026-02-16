@@ -33,52 +33,51 @@ def get_gcp_credentials():
     return None
 
 def init_vertex_ai():
-    """Vertex AIの初期化（APIキーではなくService Accountを使用）"""
+    """Vertex AIの初期化"""
     creds = get_gcp_credentials()
     if creds:
-        # プロジェクトIDを取得
-        project_id = st.secrets["gcp_service_account"]["project_id"]
-        # Vertex AIを初期化 (locationは適宜変更可能: us-central1, asia-northeast1など)
-        vertexai.init(project=project_id, location="us-central1", credentials=creds)
-        return True
+        try:
+            project_id = st.secrets["gcp_service_account"]["project_id"]
+            # locationは us-central1 が最もモデル対応が早いです
+            vertexai.init(project=project_id, location="us-central1", credentials=creds)
+            return True
+        except Exception as e:
+            st.error(f"Vertex AI 初期化エラー: {e}")
+            return False
     return False
 
-# --- 教科書読み込み (Vertex AI版) ---
+# --- 教科書読み込み ---
 @st.cache_resource
 def upload_textbook_to_gemini():
-    # Vertex AIではファイルのアップロード方法が異なるため、
-    # 簡易的にテキスト抽出してプロンプトに含めるか、GCSを使用する必要があります。
-    # ここでは、既存の構造を維持するため「テキスト読み込み」はスキップし、
-    # 必要な場合はテキストデータをプロンプトに直接埋め込む方式を想定します。
-    # ※ 本格的なRAG(検索)を行う場合は Vertex AI Search の導入を推奨します。
     return []
 
 # --- AI生成関数 (Vertex AI Gemini) ---
 def safe_generate_content(content_text):
     if not init_vertex_ai():
-        return "認証エラー: Service Accountの設定を確認してください。"
+        return "システムエラー: Vertex AI APIが無効か、認証に失敗しました。"
 
-    # Vertex AIで利用可能なモデル
+    # モデル名のリスト（エイリアスを使用）
     candidate_models = [
-        "gemini-1.5-flash-001", # 安定版
-        "gemini-1.5-pro-001",
-        "gemini-1.0-pro-001"
+        "gemini-1.5-flash", # 最新のFlash
+        "gemini-1.5-pro",   # 最新のPro
+        "gemini-1.0-pro"    # 旧安定版
     ]
     
     last_error = ""
     for model_name in candidate_models:
         try:
             model = GenerativeModel(model_name)
-            # 安全設定（必要に応じて調整）
             response = model.generate_content(
                 content_text,
-                generation_config={"temperature": 0.7, "max_output_tokens": 8192}
+                generation_config={"temperature": 0.7, "max_output_tokens": 2048}
             )
             return response.text 
         except Exception as e:
             last_error = str(e)
             continue
-    return f"生成エラー: Vertex AIへの接続に失敗しました。\n詳細: {last_error}"
+            
+    # 全モデル失敗時のエラー詳細
+    return f"生成エラー: Vertex AIへの接続に失敗しました。\nヒント: Google Cloud Consoleで 'Vertex AI API' を有効にしてください。\n詳細: {last_error}"
 
 # --- 音声合成 (Vertex AI / Cloud TTS) ---
 def text_to_speech(text, speed=1.0, pitch=0.0):
@@ -88,17 +87,15 @@ def text_to_speech(text, speed=1.0, pitch=0.0):
     client = texttospeech.TextToSpeechClient(credentials=creds)
     synthesis_input = texttospeech.SynthesisInput(text=text)
     
-    # Vertex AI品質の音声 (Neural2)
     voice = texttospeech.VoiceSelectionParams(
         language_code="ja-JP",
-        name="ja-JP-Neural2-B" # 女性音声
+        name="ja-JP-Neural2-B" 
     )
     
-    # 話速とピッチの調整（Vertex AIの特長）
     audio_config = texttospeech.AudioConfig(
         audio_encoding=texttospeech.AudioEncoding.MP3,
-        speaking_rate=speed, # 話す速度 (0.25 ~ 4.0)
-        pitch=pitch          # 声の高さ (-20.0 ~ 20.0)
+        speaking_rate=speed,
+        pitch=pitch
     )
     
     try:
@@ -112,7 +109,6 @@ def text_to_speech(text, speed=1.0, pitch=0.0):
 
 # --- Gemini 質問生成 ---
 def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
-    # 履歴をテキスト化
     history_text = "\n".join([f"{h['role']}: {h['text']}" for h in history if h['role'] in ['examiner', 'student']])
     
     mode_instruction = ""
@@ -135,7 +131,6 @@ def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
     質問のみを出力してください。
     """
     
-    # Vertex AIではテキストのみを渡す形に変更
     return safe_generate_content(prompt)
 
 # --- 評価生成 ---
@@ -153,13 +148,12 @@ def speech_to_text(audio_bytes):
     if not creds: return None, "認証エラー"
     client = speech.SpeechClient(credentials=creds)
     
-    # Vertex AIの音声認識モデル (latest_long推奨)
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED,
         sample_rate_hertz=16000,
         language_code="ja-JP",
-        enable_automatic_punctuation=True, # 自動句読点
-        model="latest_long" # より高精度なモデル
+        enable_automatic_punctuation=True,
+        model="latest_long"
     )
     try:
         audio = speech.RecognitionAudio(content=audio_bytes)
@@ -211,12 +205,12 @@ with st.sidebar:
     
     st.divider()
     st.subheader("🔊 音声設定")
-    tts_speed = st.slider("話す速さ", 0.5, 2.0, 1.0, 0.1, help="1.0が標準です")
-    tts_pitch = st.slider("声の高さ", -5.0, 5.0, 0.0, 1.0, help="プラスで高く、マイナスで低くなります")
+    tts_speed = st.slider("話す速さ", 0.5, 2.0, 1.0, 0.1)
+    tts_pitch = st.slider("声の高さ", -5.0, 5.0, 0.0, 1.0)
 
     if mode == "🐣 練習モード":
         st.session_state.exam_config = {"is_exam": False}
-        st.info("AIが声で話しかけます。")
+        st.info("Vertex AIモードで稼働中")
         
     elif mode == "📝 試験モード":
         st.divider()
