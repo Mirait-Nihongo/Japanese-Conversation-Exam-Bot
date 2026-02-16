@@ -1,18 +1,17 @@
-
 import streamlit as st
 import os
 import time
 import tempfile
 import datetime
-import google.generativeai as genai
+import vertexai
+from vertexai.generative_models import GenerativeModel, SafetySetting
 from google.cloud import speech
 from google.cloud import texttospeech
 from google.oauth2 import service_account
 import gspread
-import importlib.metadata
 
 # --- ページ設定 ---
-st.set_page_config(page_title="日本語会話試験システム", page_icon="🎙️", layout="wide")
+st.set_page_config(page_title="日本語会話試験システム (Vertex AI)", page_icon="☁️", layout="wide")
 
 # --- 定数・初期設定 ---
 MATERIALS_DIR = "materials"
@@ -27,71 +26,79 @@ PHASE_ORDER = ["warmup", "level_check", "level_check", "probe", "wind_down"]
 # 管理者パスワード
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin")
 
-# --- 認証関係 ---
+# --- 認証関係 (Vertex AI & Google Cloud) ---
 def get_gcp_credentials():
     if "gcp_service_account" in st.secrets:
         return service_account.Credentials.from_service_account_info(st.secrets["gcp_service_account"])
     return None
 
-def configure_gemini():
-    if "GEMINI_API_KEY" in st.secrets:
-        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+def init_vertex_ai():
+    """Vertex AIの初期化（APIキーではなくService Accountを使用）"""
+    creds = get_gcp_credentials()
+    if creds:
+        # プロジェクトIDを取得
+        project_id = st.secrets["gcp_service_account"]["project_id"]
+        # Vertex AIを初期化 (locationは適宜変更可能: us-central1, asia-northeast1など)
+        vertexai.init(project=project_id, location="us-central1", credentials=creds)
         return True
     return False
 
-# --- 教科書読み込み ---
+# --- 教科書読み込み (Vertex AI版) ---
 @st.cache_resource
 def upload_textbook_to_gemini():
-    if not configure_gemini(): return [] 
-    if not os.path.exists(MATERIALS_DIR): os.makedirs(MATERIALS_DIR)
-    uploaded_files = []
-    for file in os.listdir(MATERIALS_DIR):
-        if file.lower().endswith(".pdf"):
-            try:
-                g_file = genai.upload_file(os.path.join(MATERIALS_DIR, file))
-                while g_file.state.name == "PROCESSING": 
-                    time.sleep(1)
-                    g_file = genai.get_file(g_file.name)
-                if g_file.state.name == "ACTIVE": 
-                    uploaded_files.append(g_file)
-            except: pass
-    return uploaded_files
+    # Vertex AIではファイルのアップロード方法が異なるため、
+    # 簡易的にテキスト抽出してプロンプトに含めるか、GCSを使用する必要があります。
+    # ここでは、既存の構造を維持するため「テキスト読み込み」はスキップし、
+    # 必要な場合はテキストデータをプロンプトに直接埋め込む方式を想定します。
+    # ※ 本格的なRAG(検索)を行う場合は Vertex AI Search の導入を推奨します。
+    return []
 
-# --- AI生成関数 (Gemini 2.0 Flash優先) ---
-def safe_generate_content(content_data):
-    configure_gemini()
+# --- AI生成関数 (Vertex AI Gemini) ---
+def safe_generate_content(content_text):
+    if not init_vertex_ai():
+        return "認証エラー: Service Accountの設定を確認してください。"
+
+    # Vertex AIで利用可能なモデル
     candidate_models = [
-        "models/gemini-2.0-flash",       
-        "gemini-2.0-flash",              
-        "models/gemini-1.5-flash",       
-        "models/gemini-pro"
+        "gemini-1.5-flash-001", # 安定版
+        "gemini-1.5-pro-001",
+        "gemini-1.0-pro-001"
     ]
+    
     last_error = ""
     for model_name in candidate_models:
         try:
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(content_data)
+            model = GenerativeModel(model_name)
+            # 安全設定（必要に応じて調整）
+            response = model.generate_content(
+                content_text,
+                generation_config={"temperature": 0.7, "max_output_tokens": 8192}
+            )
             return response.text 
         except Exception as e:
             last_error = str(e)
             continue
-    return f"生成エラー: 接続失敗。詳細: {last_error}"
+    return f"生成エラー: Vertex AIへの接続に失敗しました。\n詳細: {last_error}"
 
-# --- 音声合成 (Text-to-Speech) ---
-def text_to_speech(text):
+# --- 音声合成 (Vertex AI / Cloud TTS) ---
+def text_to_speech(text, speed=1.0, pitch=0.0):
     creds = get_gcp_credentials()
     if not creds: return None
     
     client = texttospeech.TextToSpeechClient(credentials=creds)
     synthesis_input = texttospeech.SynthesisInput(text=text)
     
+    # Vertex AI品質の音声 (Neural2)
     voice = texttospeech.VoiceSelectionParams(
         language_code="ja-JP",
-        name="ja-JP-Neural2-B" 
+        name="ja-JP-Neural2-B" # 女性音声
     )
     
+    # 話速とピッチの調整（Vertex AIの特長）
     audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3
+        audio_encoding=texttospeech.AudioEncoding.MP3,
+        speaking_rate=speed, # 話す速度 (0.25 ~ 4.0)
+        pitch=pitch          # 声の高さ (-20.0 ~ 20.0)
     )
     
     try:
@@ -105,6 +112,7 @@ def text_to_speech(text):
 
 # --- Gemini 質問生成 ---
 def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
+    # 履歴をテキスト化
     history_text = "\n".join([f"{h['role']}: {h['text']}" for h in history if h['role'] in ['examiner', 'student']])
     
     mode_instruction = ""
@@ -127,10 +135,8 @@ def get_opi_question(cefr, phase, history, info, textbook_files, exam_context):
     質問のみを出力してください。
     """
     
-    content = [prompt]
-    if textbook_files: content.extend(textbook_files)
-    
-    return safe_generate_content(content)
+    # Vertex AIではテキストのみを渡す形に変更
+    return safe_generate_content(prompt)
 
 # --- 評価生成 ---
 def evaluate_response(question, answer, cefr, phase):
@@ -139,18 +145,21 @@ def evaluate_response(question, answer, cefr, phase):
     目標:{cefr}, 質問:{question}, 回答:{answer}
     出力: Markdown箇条書きで 1.レベル判定 2.正確さ 3.助言
     """
-    return safe_generate_content([prompt])
+    return safe_generate_content(prompt)
 
-# --- 音声認識 ---
+# --- 音声認識 (Vertex AI / Cloud Speech) ---
 def speech_to_text(audio_bytes):
     creds = get_gcp_credentials()
     if not creds: return None, "認証エラー"
     client = speech.SpeechClient(credentials=creds)
+    
+    # Vertex AIの音声認識モデル (latest_long推奨)
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED,
         sample_rate_hertz=16000,
         language_code="ja-JP",
-        enable_automatic_punctuation=True
+        enable_automatic_punctuation=True, # 自動句読点
+        model="latest_long" # より高精度なモデル
     )
     try:
         audio = speech.RecognitionAudio(content=audio_bytes)
@@ -172,7 +181,7 @@ def save_result(student_info, level, exam_context, history):
         sheet = client.open_by_url(sheet_url).sheet1
         
         exam_name = f"{exam_context['year']} {exam_context['type']}" if exam_context['is_exam'] else "練習"
-        summary = safe_generate_content([f"会話ログから総評を100文字で:\n{str(history)}"])
+        summary = safe_generate_content(f"会話ログから総評を100文字で:\n{str(history)}")
         
         row = [
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), 
@@ -193,14 +202,18 @@ if "exam_state" not in st.session_state: st.session_state.exam_state = "setting"
 if "phase_index" not in st.session_state: st.session_state.phase_index = 0
 if "exam_config" not in st.session_state: st.session_state.exam_config = {"is_exam": False}
 if "latest_audio" not in st.session_state: st.session_state.latest_audio = None
-# 認識結果の一時保存用（キーを変数で管理するため）
 if "current_transcript" not in st.session_state: st.session_state.current_transcript = ""
 
 # --- サイドバー ---
 with st.sidebar:
-    st.header("⚙️ システム設定")
+    st.header("⚙️ システム設定 (Vertex AI)")
     mode = st.radio("モード", ["🐣 練習モード", "📝 試験モード"], index=0 if not st.session_state.exam_config["is_exam"] else 1)
     
+    st.divider()
+    st.subheader("🔊 音声設定")
+    tts_speed = st.slider("話す速さ", 0.5, 2.0, 1.0, 0.1, help="1.0が標準です")
+    tts_pitch = st.slider("声の高さ", -5.0, 5.0, 0.0, 1.0, help="プラスで高く、マイナスで低くなります")
+
     if mode == "🐣 練習モード":
         st.session_state.exam_config = {"is_exam": False}
         st.info("AIが声で話しかけます。")
@@ -226,8 +239,6 @@ with st.sidebar:
                     st.rerun()
 
     st.divider()
-    if configure_gemini():
-        upload_textbook_to_gemini()
     if st.button("リセット"):
         st.session_state.clear()
         st.rerun()
@@ -237,7 +248,7 @@ if st.session_state.exam_config["is_exam"]:
     conf = st.session_state.exam_config
     st.title(f"📝 {conf['year']} {conf['type']}")
 else:
-    st.title("🗣️ 日本語会話 (Gemini Live Mode)")
+    st.title("🗣️ 日本語会話 (Vertex AI Mode)")
 
 # 1. 設定画面
 if st.session_state.exam_state == "setting":
@@ -267,13 +278,12 @@ elif st.session_state.exam_state == "ready":
             with st.spinner("AIが質問を生成しています..."):
                 q = get_opi_question(st.session_state.cefr_level, current, [], st.session_state.student_info, [], st.session_state.exam_config)
                 st.session_state.history.append({"role": "examiner", "text": q, "phase": current})
-                audio_data = text_to_speech(q)
+                audio_data = text_to_speech(q, tts_speed, tts_pitch)
                 st.session_state.latest_audio = audio_data
                 st.rerun()
 
 # 3. 会話画面
 elif st.session_state.exam_state == "interview":
-    # 進捗バー
     prog = (st.session_state.phase_index + 1) / len(PHASE_ORDER)
     st.progress(prog)
     
@@ -295,68 +305,54 @@ elif st.session_state.exam_state == "interview":
 
     st.markdown("---")
     
-    # ★重要: フェーズごとに異なるキーを使うことで、マイクコンポーネントを強制リセットする
-    # これにより、次の質問に移ったときに前の録音が消えます
     current_key = f"audio_recorder_{st.session_state.phase_index}"
+    audio_val = st.audio_input("録音ボタンを押して話し、停止ボタンを押してください（自動送信）", key=current_key)
     
-    # 録音ウィジェット
-    audio_val = st.audio_input("録音 (クリックして開始/停止)", key=current_key)
-    
-    # 音声がある場合、即座に文字起こしする
     if audio_val:
-        # すでに文字起こし済みでない場合のみ処理
-        with st.spinner("音声を文字に変換中..."):
+        with st.status("🔄 音声を解析して、AIに送信しています...", expanded=True) as status:
+            
+            st.write("📂 音声データを変換中...")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
                 tmp.write(audio_val.getvalue())
                 webm_path = tmp.name
             mp3_path = webm_path + ".mp3"
             os.system(f'ffmpeg -y -i "{webm_path}" -ac 1 -ar 16000 -ab 32k "{mp3_path}" -loglevel quiet')
             
+            st.write("🎧 音声を文字に起こしています (Vertex AI)...")
             with open(mp3_path, "rb") as f: content = f.read()
             text, err = speech_to_text(content)
             try: os.remove(webm_path); os.remove(mp3_path)
             except: pass
             
             if text:
-                st.session_state.current_transcript = text
-            else:
-                st.error("聞き取れませんでした。もう一度録音してください。")
-    
-    # 文字起こし結果がある場合、解答ボタンを表示
-    if st.session_state.current_transcript:
-        st.success(f"🗣️ **あなたの回答:** {st.session_state.current_transcript}")
-        
-        # 解答ボタン
-        if st.button("✅ 解答する (次へ)", type="primary"):
-            # 回答を確定
-            final_text = st.session_state.current_transcript
-            st.session_state.current_transcript = "" # 一時データをクリア
-            
-            st.session_state.history.append({"role": "student", "text": final_text})
-            
-            # 現在のフェーズを取得
-            current_phase_key = PHASE_ORDER[st.session_state.phase_index]
-            
-            # 評価生成
-            eval_text = evaluate_response(last_q, final_text, st.session_state.cefr_level, current_phase_key)
-            st.session_state.history.append({"role": "grade", "text": eval_text})
-            
-            # フェーズ進行
-            st.session_state.phase_index += 1
-            
-            if st.session_state.phase_index < len(PHASE_ORDER):
-                next_p = PHASE_ORDER[st.session_state.phase_index]
-                next_q = get_opi_question(st.session_state.cefr_level, next_p, st.session_state.history, st.session_state.student_info, [], st.session_state.exam_config)
-                st.session_state.history.append({"role": "examiner", "text": next_q, "phase": next_p})
+                st.write(f"📝 聞き取り完了: 「{text}」")
+                st.write("🤖 Vertex AIが回答と評価を生成中...")
                 
-                next_audio = text_to_speech(next_q)
-                st.session_state.latest_audio = next_audio
-                # rerunすることで、key="audio_recorder_{index}" が新しいIDになり、
-                # 自動的にマイク入力がリセット（クリア）されます。
-                st.rerun()
+                st.session_state.history.append({"role": "student", "text": text})
+                
+                current_phase_key = PHASE_ORDER[st.session_state.phase_index]
+                eval_text = evaluate_response(last_q, text, st.session_state.cefr_level, current_phase_key)
+                st.session_state.history.append({"role": "grade", "text": eval_text})
+                
+                st.session_state.phase_index += 1
+                if st.session_state.phase_index < len(PHASE_ORDER):
+                    next_p = PHASE_ORDER[st.session_state.phase_index]
+                    next_q = get_opi_question(st.session_state.cefr_level, next_p, st.session_state.history, st.session_state.student_info, [], st.session_state.exam_config)
+                    st.session_state.history.append({"role": "examiner", "text": next_q, "phase": next_p})
+                    
+                    st.write("🗣️ 次の音声を生成中...")
+                    next_audio = text_to_speech(next_q, tts_speed, tts_pitch)
+                    st.session_state.latest_audio = next_audio
+                    
+                    status.update(label="完了！次の質問へ進みます", state="complete", expanded=False)
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.session_state.exam_state = "finished"
+                    st.rerun()
             else:
-                st.session_state.exam_state = "finished"
-                st.rerun()
+                status.update(label="聞き取れませんでした", state="error")
+                st.error("音声が聞き取れませんでした。もう一度録音してください。")
 
 # 4. 終了
 elif st.session_state.exam_state == "finished":
